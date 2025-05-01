@@ -1,4 +1,3 @@
-// node.c — рабочий узел
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,8 +6,16 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <pthread.h>
 
 #define BUFFER_SIZE 1024
+#define MAX_THREADS 4
+
+typedef struct {
+    char **words;
+    int start;
+    int end;
+} SortArgs;
 
 int compare(const void *a, const void *b) {
     return strcmp(*(char **)a, *(char **)b);
@@ -23,6 +30,39 @@ void clean_word(char *word) {
         src++;
     }
     *dst = '\0';
+}
+
+void *thread_sort(void *arg) {
+    SortArgs *args = (SortArgs *)arg;
+    qsort(args->words + args->start, args->end - args->start, sizeof(char *), compare);
+    return NULL;
+}
+
+char **multiway_merge(char **words, int total, int parts, int *boundaries, int *result_count) {
+    char **result = malloc(total * sizeof(char *));
+    int *indexes = calloc(parts, sizeof(int));
+    int *ends = malloc(parts * sizeof(int));
+    for (int i = 0; i < parts; ++i)
+        ends[i] = boundaries[i + 1];
+
+    int pos = 0;
+    while (1) {
+        int min_idx = -1;
+        for (int i = 0; i < parts; ++i) {
+            int idx = boundaries[i] + indexes[i];
+            if (idx >= ends[i]) continue;
+            if (min_idx == -1 ||
+                strcmp(words[idx], words[boundaries[min_idx] + indexes[min_idx]]) < 0) {
+                min_idx = i;
+            }
+        }
+        if (min_idx == -1) break;
+        result[pos++] = words[boundaries[min_idx] + indexes[min_idx]++];
+    }
+    *result_count = pos;
+    free(indexes);
+    free(ends);
+    return result;
 }
 
 int main(int argc, char *argv[]) {
@@ -40,31 +80,15 @@ int main(int argc, char *argv[]) {
     size_t word_count = 0;
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("Ошибка создания сокета");
-        return 1;
-    }
-
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Ошибка привязки сокета");
-        return 1;
-    }
-
-    if (listen(server_fd, 1) < 0) {
-        perror("Ошибка прослушивания");
-        return 1;
-    }
+    bind(server_fd, (struct sockaddr *)&address, sizeof(address));
+    listen(server_fd, 1);
 
     printf("Узел: ожидание части файла на порту %d...\n", PORT);
     client_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
-    if (client_socket < 0) {
-        perror("Ошибка accept");
-        return 1;
-    }
 
     // Считать ID узла
     char id_buf[16] = {0};
@@ -76,31 +100,21 @@ int main(int argc, char *argv[]) {
     id_buf[id_len] = 0;
     int node_id = atoi(id_buf);
 
-    // Читаем входной текст
-    size_t total_len = 0;
-    size_t buffer_cap = BUFFER_SIZE;
+    // Получить текст
+    size_t total_len = 0, buffer_cap = BUFFER_SIZE;
     char *text = malloc(buffer_cap);
-    if (!text) {
-        perror("malloc");
-        return 1;
-    }
-
     ssize_t bytes;
     while ((bytes = recv(client_socket, buffer, BUFFER_SIZE, 0)) > 0) {
         if (total_len + bytes >= buffer_cap) {
             buffer_cap *= 2;
             text = realloc(text, buffer_cap);
-            if (!text) {
-                perror("realloc");
-                return 1;
-            }
         }
         memcpy(text + total_len, buffer, bytes);
         total_len += bytes;
     }
     text[total_len] = '\0';
 
-    // Разделить на слова
+    // Токенизация
     char *token = strtok(text, " \n\r\t");
     while (token) {
         clean_word(token);
@@ -112,22 +126,40 @@ int main(int argc, char *argv[]) {
     }
     free(text);
 
-    // Сортировка
-    qsort(words, word_count, sizeof(char *), compare);
+    // Разделим на части
+    int threads_used = (word_count < MAX_THREADS) ? word_count : MAX_THREADS;
+    pthread_t threads[threads_used];
+    SortArgs args[threads_used];
+    int boundaries[threads_used + 1];
 
-    // Отправка: всё в одну строку
-    for (size_t i = 0; i < word_count; ++i) {
-        send(client_socket, words[i], strlen(words[i]), 0);
-        if (i < word_count - 1) {
-            send(client_socket, " ", 1, 0);
-        }
-        free(words[i]);
+    for (int i = 0; i <= threads_used; ++i)
+        boundaries[i] = i * word_count / threads_used;
+
+    for (int i = 0; i < threads_used; ++i) {
+        args[i].words = words;
+        args[i].start = boundaries[i];
+        args[i].end = boundaries[i + 1];
+        pthread_create(&threads[i], NULL, thread_sort, &args[i]);
     }
+
+    for (int i = 0; i < threads_used; ++i)
+        pthread_join(threads[i], NULL);
+
+    // Слияние
+    int result_count = 0;
+    char **sorted = multiway_merge(words, word_count, threads_used, boundaries, &result_count);
+
+    // Отправка результата
+    for (int i = 0; i < result_count; ++i) {
+        send(client_socket, sorted[i], strlen(sorted[i]), 0);
+        if (i < result_count - 1) send(client_socket, " ", 1, 0);
+        free(sorted[i]);
+    }
+    free(sorted);
     free(words);
 
-    printf("Узел #%d: отправка завершена (в одной строке)\n", node_id);
+    printf("Узел #%d: отправка завершена (многопоточная сортировка)\n", node_id);
     close(client_socket);
     close(server_fd);
     return 0;
 }
-
